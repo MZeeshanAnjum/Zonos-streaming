@@ -1,0 +1,317 @@
+##############################################
+import time
+import torch
+import torchaudio
+import io
+import base64
+import numpy as np
+import ffmpeg
+import logging
+from datetime import datetime
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+from zonos.model import Zonos
+from zonos.conditioning import make_cond_dict
+from zonos.utils import DEFAULT_DEVICE as device
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# === FastAPI setup ===
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+
+# === Request schema ===
+class TTSRequest(BaseModel):
+    text: str
+    emotion: Optional[List[float]] = [1.0, 0.05, 0.05, 0.05, 0.05, 0.05, 0.1, 0.2]
+    vqscore: Optional[float] = 0.78
+    fmax: int = 24000
+    pitch_std: float = 45.0
+    speaking_rate: float = 15.0
+    dnsmos_ovrl: float = 4.0
+    speaker_noised: bool = False
+    cfg_scale: float = 2.8
+    unconditional_keys: Optional[List[str]] = ["speaking_rate"]
+    sampling_params: Optional[dict] = {
+        "top_p": 0.85,
+        "top_k": 20,
+        "min_p": 0.25,
+        "linear": 0.3,
+        "conf": 0.4,
+        "quad": 0.0,
+    }
+    speaker_audio_base64: Optional[str] = None  # Removed since we are no longer processing speaker audio per request
+
+
+# === Utility ===
+def fix_base64_padding(b64_string):
+    return b64_string + '=' * (-len(b64_string) % 4)
+
+def decode_audio(file_path):
+    # Assuming neutral audio is a fixed reference file for now
+    audio_tensor, sr = torchaudio.load(file_path, normalize=True)
+    return audio_tensor, sr
+
+
+
+
+# === Model Loading (ONCE) ===
+logging.info("Loading model...")
+start = time.time()
+model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device=device)
+model.requires_grad_(False).eval()
+
+# Preload neutral speaker embedding
+logging.info("Preloading neutral speaker embedding...")
+neutral_audio_tensor, _ = decode_audio("neutral.mp3")  # Assuming you have a neutral audio sample file
+neutral_speaker_embedding = model.make_speaker_embedding(neutral_audio_tensor, 44100).to(device, dtype=torch.bfloat16)
+
+model_load_time = time.time() - start
+logging.info(f"Model loaded in {model_load_time:.2f} seconds")
+
+# === Model Warmup (ONCE) ===
+logging.info("Starting model warmup...")
+warmup_start = time.time()
+with torch.no_grad():
+    logging.info("Generating 20 tokens for warmup...")
+    dummy_cond = make_cond_dict(
+        text="Warmup inference for zonos model to reduce first call latency",
+        language="en-us",
+        speaker=neutral_speaker_embedding,
+        device=device
+    )
+    dummy_conditioning = model.prepare_conditioning(dummy_cond)
+    _ = model.generate(prefix_conditioning=dummy_conditioning, max_new_tokens=20)
+warmup_time = time.time() - warmup_start
+logging.info(f"Model warmup completed in {warmup_time:.2f} seconds")
+
+sample_rate = model.autoencoder.sampling_rate
+startup_complete_time = time.time()
+logging.info(f"Server sample rate: {sample_rate}")
+
+# === Endpoint ===
+@app.post("/generate")
+async def generate_audio(req: TTSRequest):
+    logging.info(f"/generate called at {datetime.now().isoformat()}")
+
+    request_start = time.time()
+
+    try:
+        # Use preloaded neutral speaker embedding (since no speaker audio provided)
+        speaker_embedding = neutral_speaker_embedding
+
+        logging.info("Creating conditioning dictionary...")
+        start = time.time()
+        emotion_tensor = torch.tensor([req.emotion], device=device)
+        vq_tensor = torch.tensor([[req.vqscore] * 8], device=device)
+        cond_dict = make_cond_dict(
+            text=req.text,
+            language="en-us",
+            speaker=speaker_embedding,
+            emotion=emotion_tensor,
+            vqscore_8=vq_tensor,
+            fmax=req.fmax,
+            pitch_std=req.pitch_std,
+            speaking_rate=req.speaking_rate,
+            dnsmos_ovrl=req.dnsmos_ovrl,
+            speaker_noised=req.speaker_noised,
+            device=device,
+            unconditional_keys=req.unconditional_keys,
+        )
+        conditioning = model.prepare_conditioning(cond_dict)
+        conditioning_time = time.time() - start
+        logging.info(f"Conditioning prepared in {conditioning_time:.2f} seconds")
+
+        logging.info("Starting streaming generation...")
+        gen_start = time.time()
+        stream_generator = model.stream(
+            prefix_conditioning=conditioning,
+            audio_prefix_codes=None,
+            chunk_schedule=[17, *range(9, 100)],
+            chunk_overlap=1,
+            cfg_scale=req.cfg_scale,
+            seed=420,
+            randomize_seed=True,
+            sampling_params=req.sampling_params,
+        )
+
+        all_chunks = []
+        total_samples = 0
+
+        async def audio_stream():
+            nonlocal total_samples
+            chunk_count = 0
+            for audio_chunk in stream_generator:
+                chunk_count += 1
+                num_samples = audio_chunk.shape[-1]
+                start_time = total_samples / sample_rate
+                total_samples += num_samples
+                end_time = total_samples / sample_rate
+
+                logging.info(
+                    f"Received chunk {chunk_count}: "
+                    f"starts at {start_time:.3f}s | ends at {end_time:.3f}s"
+                )
+
+                all_chunks.append(audio_chunk.cpu())
+                pcm_bytes = audio_chunk.cpu().numpy().astype(np.float32).tobytes()
+                yield pcm_bytes
+
+            stream_time = time.time() - gen_start
+            logging.info(f"Streaming generation finished in {stream_time:.2f} seconds")
+
+            logging.info("Concatenating audio chunks...")
+            concat_start = time.time()
+            complete_audio_tensor = torch.cat(all_chunks, dim=-1)
+            concat_time = time.time() - concat_start
+            logging.info(f"Audio concatenated in {concat_time:.2f} seconds")
+
+            logging.info("Saving audio...")
+            save_start = time.time()
+            torchaudio.save("stream_sample.wav", complete_audio_tensor, sample_rate)
+            save_time = time.time() - save_start
+            logging.info(
+                f"Saved streaming audio to 'stream_sample.wav' (sampling rate: {sample_rate} Hz) "
+                f"in {save_time:.2f} seconds."
+            )
+
+            total_request_time = time.time() - request_start
+            logging.info(f"Total processing time: {total_request_time:.2f} seconds")
+            logging.info("Performance breakdown:")
+            logging.info(f"  - Speaker embedding: 0.00s (no speaker audio used)")
+            logging.info(f"  - Conditioning: {conditioning_time:.2f}s ({conditioning_time / total_request_time:.1%})")
+            logging.info(f"  - Streaming generation: {stream_time:.2f}s ({stream_time / total_request_time:.1%})")
+            logging.info(f"  - Concatenation: {concat_time:.2f}s ({concat_time / total_request_time:.1%})")
+            logging.info(f"  - Saving: {save_time:.2f}s ({save_time / total_request_time:.1%})")
+
+        return StreamingResponse(audio_stream(), media_type="audio/raw")
+
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+from fastapi import WebSocket, WebSocketDisconnect
+
+@app.websocket("/ws/tts")
+async def tts_websocket(websocket: WebSocket):
+    await websocket.accept()
+    logging.info(f"[WS] /ws/tts connected at {datetime.now().isoformat()}")
+
+    try:
+        while True:
+            # Step 1: Receive and parse the JSON payload
+            request_json = await websocket.receive_json()
+            req = TTSRequest(**request_json)
+            logging.info(f"[WS] Received TTS request at {datetime.now().isoformat()}")
+    
+            request_start = time.time()
+    
+            # Use preloaded neutral speaker embedding (no need to load audio)
+            speaker_embedding = neutral_speaker_embedding
+    
+            # Step 2: Prepare conditioning
+            logging.info("[WS] Creating conditioning dictionary...")
+            start = time.time()
+            emotion_tensor = torch.tensor([req.emotion], device=device)
+            vq_tensor = torch.tensor([[req.vqscore] * 8], device=device)
+            cond_dict = make_cond_dict(
+                text=req.text,
+                language="en-us",
+                speaker=speaker_embedding,
+                emotion=emotion_tensor,
+                vqscore_8=vq_tensor,
+                fmax=req.fmax,
+                pitch_std=req.pitch_std,
+                speaking_rate=req.speaking_rate,
+                dnsmos_ovrl=req.dnsmos_ovrl,
+                speaker_noised=req.speaker_noised,
+                device=device,
+                unconditional_keys=["speaking_rate"],
+            )
+            conditioning = model.prepare_conditioning(cond_dict)
+            conditioning_time = time.time() - start
+            logging.info(f"[WS] Conditioning prepared in {conditioning_time:.2f} seconds")
+    
+            # Step 3: Stream generation
+            logging.info("[WS] Starting streaming generation...")
+            gen_start = time.time()
+            stream_generator = model.stream(
+                prefix_conditioning=conditioning,
+                audio_prefix_codes=None,
+                chunk_schedule=[17, *range(9, 100)],
+                chunk_overlap=1,
+                cfg_scale=req.cfg_scale,
+                sampling_params=req.sampling_params,
+            )
+    
+            all_chunks = []
+            total_samples = 0
+            chunk_count = 0
+    
+            for audio_chunk in stream_generator:
+                chunk_count += 1
+                num_samples = audio_chunk.shape[-1]
+                start_time = total_samples / sample_rate
+                total_samples += num_samples
+                end_time = total_samples / sample_rate
+    
+                logging.info(
+                    f"[WS] Chunk {chunk_count}: {start_time:.3f}s → {end_time:.3f}s"
+                )
+                
+    
+                all_chunks.append(audio_chunk.cpu())
+                pcm_bytes = audio_chunk.cpu().numpy().astype(np.float32).tobytes()
+                await websocket.send_bytes(pcm_bytes)
+    
+            # Step 4: Finish
+            stream_time = time.time() - gen_start
+            logging.info(f"[WS] Streaming generation finished in {stream_time:.2f} seconds")
+    
+            logging.info("[WS] Concatenating audio chunks...")
+            concat_start = time.time()
+            complete_audio_tensor = torch.cat(all_chunks, dim=-1)
+            concat_time = time.time() - concat_start
+    
+            logging.info("[WS] Saving audio...")
+            save_start = time.time()
+            torchaudio.save("stream_sample_ws.wav", complete_audio_tensor, sample_rate)
+            save_time = time.time() - save_start
+    
+            total_time = time.time() - request_start
+            logging.info(f"[WS] Total processing time: {total_time:.2f}s")
+            logging.info("[WS] Breakdown:")
+            logging.info(f"  - Embedding: 0.00s (no speaker audio used)")
+            logging.info(f"  - Conditioning: {conditioning_time:.2f}s")
+            logging.info(f"  - Generation: {stream_time:.2f}s")
+            logging.info(f"  - Concatenation: {concat_time:.2f}s")
+            logging.info(f"  - Saving: {save_time:.2f}s")
+    
+            # Notify completion
+            await websocket.send_json({"status": "STREAM_COMPLETE"})
+
+    except WebSocketDisconnect:
+        logging.warning("[WS] Client disconnected")
+    except Exception as e:
+        logging.error(f"[WS] Error: {e}")
+        await websocket.send_json({"error": str(e)})
+    finally:
+        pass
+        # await websocket.close()
