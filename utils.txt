@@ -1,0 +1,15 @@
+Zonos:
+python3 -m venv .venv
+source .venv/bin/activate
+apt update && apt install -y espeak
+uvicorn zonos_api:app --host 0.0.0.0 --port 8000
+uvicorn app:app --host 0.0.0.0 --port 8000
+
+For Faster-Whisper
+pip install -r requirements.txt
+pip install --force-reinstall ctranslate2==3.24.0
+apt update
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
+dpkg -i cuda-keyring_1.1-1_all.deb
+apt update
+apt install -y libcudnn8=8.6.0.* libcudnn8-dev=8.6.0.*
